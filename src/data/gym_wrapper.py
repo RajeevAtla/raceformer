@@ -10,6 +10,7 @@ from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 try:
     import racecar_gym  # type: ignore
@@ -37,6 +38,14 @@ class RacecarGymWrapper:
             raise RuntimeError("racecar_gym is not installed; install simulator before use.")
         self.env = racecar_gym.make(env_id)  # type: ignore[attr-defined]
         self.env.seed(seed)
+        # Cache action bounds for scaling in PPO.
+        if hasattr(self.env, "action_space"):
+            space = self.env.action_space
+            self.action_low = np.asarray(getattr(space, "low", None))
+            self.action_high = np.asarray(getattr(space, "high", None))
+        else:  # pragma: no cover - fallback when space absent
+            self.action_low = None
+            self.action_high = None
 
     def reset(self) -> dict[str, Any]:
         obs = self.env.reset()

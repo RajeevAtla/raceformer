@@ -5,11 +5,13 @@ Loads pretrained weights, optionally freezes encoders, masks missing modalities,
 and optimizes policy/value heads.
 """
 
+from pathlib import Path
 from typing import Any, Iterable
 
 import jax
 import jax.numpy as jnp
 import optax
+import numpy as np
 try:
     import orbax.checkpoint as ocp
 except ImportError:  # pragma: no cover - optional
@@ -112,18 +114,22 @@ def run_ppo(config: dict[str, Any]) -> None:
     try:
         env = RacecarGymWrapper(config.get("env_id", "Racecar-v0"), seed=config.get("seed", 0))
         step_fn = jax_step(env)
+        if config.get("action_low") is None and getattr(env, "action_low", None) is not None:
+            config["action_low"] = env.action_low
+        if config.get("action_high") is None and getattr(env, "action_high", None) is not None:
+            config["action_high"] = env.action_high
     except Exception as exc:  # pragma: no cover - allows smoke testing without simulator
         print(f"racecar_gym unavailable ({exc}); using dummy rollout.")
         env = None
         step_fn = None
 
-    def loss_fn(model: PPOModel, batch: dict[str, jnp.ndarray], rngs: nnx.Rngs) -> jnp.ndarray:
-        return ppo_loss(model, batch, config.get("clip_eps", 0.2), rngs=rngs)
+    def loss_fn(model: PPOModel, batch: dict[str, jnp.ndarray], rngs: nnx.Rngs, clip_eps: float) -> jnp.ndarray:
+        return ppo_loss(model, batch, clip_eps, rngs=rngs)
 
     @jax.jit
-    def train_step(model: PPOModel, opt: nnx.Optimizer, batch: dict[str, jnp.ndarray], rngs: nnx.Rngs):
+    def train_step(model: PPOModel, opt: nnx.Optimizer, batch: dict[str, jnp.ndarray], rngs: nnx.Rngs, clip_eps: float):
         value_and_grad = nnx.value_and_grad(loss_fn)
-        loss, grads = value_and_grad(model, batch, rngs)
+        loss, grads = value_and_grad(model, batch, rngs, clip_eps)
         opt = opt.apply_gradient(grads)
         return model, opt, loss
 
@@ -131,6 +137,9 @@ def run_ppo(config: dict[str, Any]) -> None:
     gae_lambda = config.get("gae_lambda", 0.95)
     update_epochs = config.get("update_epochs", 1)
     rollout_rng = rngs
+    action_low = config.get("action_low")
+    action_high = config.get("action_high")
+    clip_eps = config.get("clip_eps", 0.2)
     for step in range(config.get("steps", 2)):
         batch, rollout_rng = _rollout_batch(
             env,
@@ -141,10 +150,18 @@ def run_ppo(config: dict[str, Any]) -> None:
             rollout_rng,
             gamma,
             gae_lambda,
+            action_low,
+            action_high,
         ) if env else (_dummy_batch(config.get("batch_size", 2), config["action_dim"]), rollout_rng)
+        batch = _normalize_advantages(batch)
         loss = 0.0
         for _ in range(update_epochs):
-            model, optimizer, loss = train_step(model, optimizer, batch, rngs)
+            for minibatch in _iter_minibatches(
+                batch,
+                config.get("minibatch_size", config.get("batch_size", 2)),
+                key=jax.random.PRNGKey(step),
+            ):
+                model, optimizer, loss = train_step(model, optimizer, minibatch, rngs, clip_eps)
         if step % config.get("log_every", 1) == 0:
             print(f"ppo step {step}: loss {loss}")
         if ckpt_mgr and step % config.get("checkpoint_every", 1000) == 0:
@@ -161,6 +178,8 @@ def _rollout_batch(
     rngs: nnx.Rngs,
     gamma: float,
     gae_lambda: float,
+    action_low,
+    action_high,
 ) -> tuple[dict[str, jnp.ndarray], nnx.Rngs]:
     """
     Collect a rollout batch using the current policy.
@@ -169,29 +188,31 @@ def _rollout_batch(
     """
     obs = env.reset()
     observations = []
-    actions = []
-    rewards = []
-    values = []
-    log_probs = []
-    rng = rngs
-    for _ in range(batch_size):
-        obs_masked = mask_missing_modalities(obs)
-        action_mean, value, log_std = model(obs_masked, rngs=rng)
-        rng, sample_key = rng.split()
-        action = _sample_gaussian(action_mean, log_std, sample_key)
-        lp = _gaussian_logprob(action, action_mean, log_std)
-        observations.append(obs_masked)
-        actions.append(action)
-        values.append(value)
-        log_probs.append(lp)
-        step_out = env.step(action) if step_fn is None else step_fn(None, action)
-        rewards.append(step_out.reward)
-        obs = step_out.obs
-    values = jnp.asarray(values)
-    rewards = jnp.asarray(rewards)
-    returns, advantages = _compute_returns_advantages(rewards, values, gamma=gamma, gae_lambda=gae_lambda)
-    batch = {
-        "lidar": jnp.asarray([o["lidar"] for o in observations]),
+        actions = []
+        rewards = []
+        values = []
+        log_probs = []
+        rng = rngs
+        for _ in range(batch_size):
+            obs_masked = mask_missing_modalities(obs)
+            action_mean, value, log_std = model(obs_masked, rngs=rng)
+            rng, sample_key = rng.split()
+            action, lp = _sample_tanh_gaussian(action_mean, log_std, sample_key)
+            if action_low is not None and action_high is not None:
+                action = _scale_action(action, action_low, action_high)
+            observations.append(obs_masked)
+            actions.append(action)
+            values.append(value)
+            log_probs.append(lp)
+            env_action = np.asarray(action)
+            step_out = env.step(env_action) if step_fn is None else step_fn(None, action)
+            rewards.append(step_out.reward)
+            obs = step_out.obs
+        values = jnp.asarray(values)
+        rewards = jnp.asarray(rewards)
+        returns, advantages = _compute_returns_advantages(rewards, values, gamma=gamma, gae_lambda=gae_lambda)
+        batch = {
+            "lidar": jnp.asarray([o["lidar"] for o in observations]),
         "rgb": jnp.asarray([o["rgb"] for o in observations]),
         "actions": jnp.asarray(actions),
         "log_prob": jnp.asarray(log_probs),
@@ -214,6 +235,31 @@ def _dummy_batch(batch_size: int, action_dim: int) -> dict[str, jnp.ndarray]:
     }
 
 
+def _iter_minibatches(batch: dict[str, jnp.ndarray], minibatch_size: int, *, key: jax.random.KeyArray | None = None):
+    """Yield minibatches by shuffling indices and slicing."""
+    total = next(iter(batch.values())).shape[0]
+    rng = key if key is not None else jax.random.PRNGKey(0)
+    perm = jax.random.permutation(rng, total)
+    for start in range(0, total, minibatch_size):
+        idx = perm[start : start + minibatch_size]
+        yield {k: v[idx] for k, v in batch.items()}
+
+
+def _normalize_advantages(batch: dict[str, jnp.ndarray], eps: float = 1e-8) -> dict[str, jnp.ndarray]:
+    adv = batch["advantages"]
+    mean = jnp.mean(adv)
+    std = jnp.std(adv)
+    batch = dict(batch)
+    batch["advantages"] = (adv - mean) / (std + eps)
+    return batch
+
+
+def _scale_action(action: jnp.ndarray, low, high) -> jnp.ndarray:
+    low_arr = jnp.asarray(low)
+    high_arr = jnp.asarray(high)
+    return 0.5 * (high_arr - low_arr) * action + 0.5 * (high_arr + low_arr)
+
+
 def mask_missing_modalities(obs: dict[str, Any]) -> dict[str, Any]:
     """Mask radar/IR with zeros or learned tokens before model forward."""
     masked = dict(obs)
@@ -232,6 +278,19 @@ def _gaussian_logprob(actions: jnp.ndarray, mean: jnp.ndarray, log_std: jnp.ndar
     var = jnp.exp(2.0 * log_std)
     log_prob = -0.5 * (((actions - mean) ** 2) / var + 2.0 * log_std + jnp.log(2.0 * jnp.pi))
     return log_prob.sum(axis=-1)
+
+
+def _sample_tanh_gaussian(mean: jnp.ndarray, log_std: jnp.ndarray, rng: jax.random.KeyArray, epsilon: float = 1e-6) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    Sample from a squashed Gaussian and return action and corrected log-prob.
+    """
+    std = jnp.exp(log_std)
+    noise = jax.random.normal(rng, shape=mean.shape)
+    pre_tanh = mean + noise * std
+    action = jnp.tanh(pre_tanh)
+    # Change-of-variables correction for tanh squashing.
+    log_prob = _gaussian_logprob(pre_tanh, mean, log_std) - jnp.sum(jnp.log(1.0 - jnp.square(action) + epsilon), axis=-1)
+    return action, log_prob
 
 
 def _compute_returns_advantages(rewards: jnp.ndarray, values: jnp.ndarray, gamma: float, gae_lambda: float) -> tuple[jnp.ndarray, jnp.ndarray]:
