@@ -1,24 +1,58 @@
 """
 Multimodal fusion module using Flax NNX.
 
-Concatenate modality tokens and process with transformer blocks; extend with
-cross-attention if needed.
+Concatenates modality token sequences and processes them with a transformer stack.
 """
 
-from flax import nnx
 import jax.numpy as jnp
+from flax import nnx
+
+
+class FusionMLP(nnx.Module):
+    """Feed-forward block with GELU."""
+
+    def __init__(self, dim: int, mlp_dim: int, *, rngs: nnx.Rngs):
+        self.fc1 = nnx.Linear(dim, mlp_dim, rngs=rngs)
+        self.fc2 = nnx.Linear(mlp_dim, dim, rngs=rngs)
+
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        x = nnx.gelu(self.fc1(x))
+        x = self.fc2(x)
+        return x
+
+
+class FusionBlock(nnx.Module):
+    """Self-attention + MLP with pre-LayerNorm for fused tokens."""
+
+    def __init__(self, dim: int, num_heads: int, mlp_ratio: float = 4.0, *, rngs: nnx.Rngs):
+        self.ln1 = nnx.LayerNorm(dim, use_bias=True, rngs=rngs)
+        self.attn = nnx.MultiHeadAttention(embed_dim=dim, num_heads=num_heads, rngs=rngs)
+        self.ln2 = nnx.LayerNorm(dim, use_bias=True, rngs=rngs)
+        self.mlp = FusionMLP(dim=dim, mlp_dim=int(dim * mlp_ratio), rngs=rngs)
+
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        x = x + self.attn(self.ln1(x))
+        x = x + self.mlp(self.ln2(x))
+        return x
 
 
 class MultimodalFusion(nnx.Module):
-    """Placeholder fusion stack."""
+    """Transformer stack over concatenated modality tokens."""
 
-    def __init__(self, embed_dim: int, depth: int, num_heads: int):
+    def __init__(self, embed_dim: int, depth: int, num_heads: int, *, rngs: nnx.Rngs | None = None):
+        rngs = rngs or nnx.Rngs(0)
         self.embed_dim = embed_dim
         self.depth = depth
         self.num_heads = num_heads
-        # TODO: initialize transformer blocks.
+        self.blocks = [
+            FusionBlock(dim=embed_dim, num_heads=num_heads, rngs=rngs)
+            for _ in range(depth)
+        ]
+        self.norm = nnx.LayerNorm(embed_dim, use_bias=True, rngs=rngs)
 
     def __call__(self, tokens: jnp.ndarray, *, train: bool = True) -> jnp.ndarray:
         _ = train
-        # TODO: apply transformer layers for fusion.
-        raise NotImplementedError
+        for block in self.blocks:
+            tokens = block(tokens)
+        tokens = self.norm(tokens)
+        return tokens
