@@ -83,7 +83,11 @@ def run_pretraining(config: dict[str, Any]) -> None:
     modalities: Iterable[str] = config["data"].get(
         "include_modalities", ("lidar", "rgb", "radar", "ir")
     )
-    data_source = CMHTDataSource(data_path, include_modalities=tuple(modalities))
+    data_source = CMHTDataSource(
+        data_path,
+        include_modalities=tuple(modalities),
+        image_size=config["data"].get("image_size", 224),
+    )
     model_cfg = config["model"]
     training_cfg = config["training"]
 
@@ -127,7 +131,8 @@ def run_pretraining(config: dict[str, Any]) -> None:
         except StopIteration:
             batch_iter = _batch_iterator(data_source, training_cfg["batch_size"])
             batch = next(batch_iter)
-        model, optimizer, loss = train_step(model, optimizer, batch, rngs)
+        step_rngs = rngs.split()
+        model, optimizer, loss = train_step(model, optimizer, batch, step_rngs)
         if step % training_cfg.get("log_every", 100) == 0:
             print(f"step {step}: loss {loss}")
         if ckpt_mgr and step % training_cfg.get("checkpoint_every", 1000) == 0:
