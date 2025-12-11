@@ -1,0 +1,13 @@
+line-length = 120
+target-version = "py313"
+select = [
+    "E",
+    "F",
+    "I",
+    "B",
+]
+ignore = []
+
+[per-file-ignores]
+"src/training/pretrainer.py" = ["B905"]  # allow len-zero iterator reuse in placeholder loop
+"src/training/rl_agent.py" = ["B905"]
