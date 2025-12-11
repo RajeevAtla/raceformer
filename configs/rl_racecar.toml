@@ -17,7 +17,15 @@ gae_lambda = 0.95
 gamma = 0.99
 batch_size = 64
 update_epochs = 4
+minibatch_size = 32
+checkpoint_every = 1000
+checkpoint_dir = "runs/ppo/ckpt"
 
 [finetune]
 freeze_encoders = false
 pretrained_ckpt = "runs/example/ckpt"
+
+[actions]
+# Set these to env action bounds if different from [-1, 1]
+low = [-1.0, -1.0]
+high = [1.0, 1.0]

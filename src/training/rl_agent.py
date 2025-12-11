@@ -189,30 +189,39 @@ def _rollout_batch(
     obs = env.reset()
     observations = []
         actions = []
-        rewards = []
-        values = []
-        log_probs = []
-        rng = rngs
-        for _ in range(batch_size):
-            obs_masked = mask_missing_modalities(obs)
-            action_mean, value, log_std = model(obs_masked, rngs=rng)
-            rng, sample_key = rng.split()
-            action, lp = _sample_tanh_gaussian(action_mean, log_std, sample_key)
-            if action_low is not None and action_high is not None:
-                action = _scale_action(action, action_low, action_high)
-            observations.append(obs_masked)
-            actions.append(action)
-            values.append(value)
-            log_probs.append(lp)
-            env_action = np.asarray(action)
-            step_out = env.step(env_action) if step_fn is None else step_fn(None, action)
-            rewards.append(step_out.reward)
-            obs = step_out.obs
-        values = jnp.asarray(values)
-        rewards = jnp.asarray(rewards)
-        returns, advantages = _compute_returns_advantages(rewards, values, gamma=gamma, gae_lambda=gae_lambda)
-        batch = {
-            "lidar": jnp.asarray([o["lidar"] for o in observations]),
+    rewards = []
+    values = []
+    log_probs = []
+    dones = []
+    rng = rngs
+    for _ in range(batch_size):
+        obs_masked = mask_missing_modalities(obs)
+        batched_obs = _batchify_obs(obs_masked)
+        action_mean, value, log_std = model(batched_obs, rngs=rng)
+        action_mean = action_mean[0]
+        value = value[0]
+        log_std = log_std[0]
+        rng, sample_key = rng.split()
+        action, lp = _sample_tanh_gaussian(action_mean, log_std, sample_key)
+        if action_low is not None and action_high is not None:
+            action = _scale_action(action, action_low, action_high)
+        observations.append(obs_masked)
+        actions.append(action)
+        values.append(value)
+        log_probs.append(lp)
+        env_action = np.asarray(action)
+        step_out = env.step(env_action) if step_fn is None else step_fn(None, action)
+        rewards.append(step_out.reward)
+        dones.append(step_out.done)
+        obs = step_out.obs
+        if step_out.done:
+            obs = env.reset()
+    values = jnp.asarray(values)
+    rewards = jnp.asarray(rewards)
+    dones_arr = jnp.asarray(dones)
+    returns, advantages = _compute_returns_advantages(rewards, values, dones_arr, gamma=gamma, gae_lambda=gae_lambda)
+    batch = {
+        "lidar": jnp.asarray([o["lidar"] for o in observations]),
         "rgb": jnp.asarray([o["rgb"] for o in observations]),
         "actions": jnp.asarray(actions),
         "log_prob": jnp.asarray(log_probs),
@@ -260,6 +269,11 @@ def _scale_action(action: jnp.ndarray, low, high) -> jnp.ndarray:
     return 0.5 * (high_arr - low_arr) * action + 0.5 * (high_arr + low_arr)
 
 
+def _batchify_obs(obs: dict[str, Any]) -> dict[str, jnp.ndarray]:
+    """Add batch dimension to a single observation dict."""
+    return {k: jnp.expand_dims(jnp.asarray(v), axis=0) for k, v in obs.items()}
+
+
 def mask_missing_modalities(obs: dict[str, Any]) -> dict[str, Any]:
     """Mask radar/IR with zeros or learned tokens before model forward."""
     masked = dict(obs)
@@ -293,14 +307,21 @@ def _sample_tanh_gaussian(mean: jnp.ndarray, log_std: jnp.ndarray, rng: jax.rand
     return action, log_prob
 
 
-def _compute_returns_advantages(rewards: jnp.ndarray, values: jnp.ndarray, gamma: float, gae_lambda: float) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """Compute GAE(lambda) and returns for a single trajectory."""
+def _compute_returns_advantages(
+    rewards: jnp.ndarray,
+    values: jnp.ndarray,
+    dones: jnp.ndarray,
+    gamma: float,
+    gae_lambda: float,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Compute GAE(lambda) and returns for a single trajectory with terminal handling."""
     advantages = []
     gae = 0.0
     next_value = 0.0
     for t in reversed(range(rewards.shape[0])):
-        delta = rewards[t] + gamma * next_value - values[t]
-        gae = delta + gamma * gae_lambda * gae
+        mask = 1.0 - dones[t]
+        delta = rewards[t] + gamma * next_value * mask - values[t]
+        gae = delta + gamma * gae_lambda * gae * mask
         advantages.insert(0, gae)
         next_value = values[t]
     advantages = jnp.asarray(advantages)

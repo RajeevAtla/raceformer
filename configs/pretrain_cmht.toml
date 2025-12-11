@@ -11,8 +11,12 @@ batch_size = 64
 learning_rate = 3e-4
 steps = 100000
 mask_ratio = 0.5
+seed = 0
+log_every = 100
+checkpoint_every = 1000
 checkpoint_dir = "runs/example/ckpt"
 
 [data]
 path = "/path/to/cmht"
 include_modalities = ["lidar", "rgb", "radar", "ir", "gps", "imu"]
+image_size = 224
