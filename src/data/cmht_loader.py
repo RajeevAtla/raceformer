@@ -51,13 +51,17 @@ class CMHTDataSource:
         data_dir: str | Path,
         include_modalities: tuple[str, ...] | None = None,
         image_size: int | tuple[int, int] = 224,
+        bev_size: int = 256,
+        bev_range: tuple[tuple[float, float], tuple[float, float]] = ((-50.0, 50.0), (-50.0, 50.0)),
     ):
         self.data_dir = Path(data_dir)
         self.include_modalities = include_modalities or ("lidar", "rgb", "radar", "ir", "gps", "imu")
         self.image_size = image_size if isinstance(image_size, tuple) else (image_size, image_size)
-        if gr is not None:
-            self.data_source = gr.FileDataSource(str(self.data_dir))  # placeholder for real Grain pipeline
-        else:
+        self.bev_size = bev_size
+        self.bev_range = bev_range
+        try:
+            self.data_source = gr.FileDataSource(str(self.data_dir)) if gr is not None and hasattr(gr, "FileDataSource") else None  # type: ignore[attr-defined]
+        except Exception:
             self.data_source = None
         self.index = self._load_index()
 
@@ -167,11 +171,15 @@ class CMHTDataSource:
     def _preprocess_lidar(self, lidar_raw: Any) -> np.ndarray:
         """Voxelize or project LiDAR to BEV images or patch tokens. Placeholder returns input as float32."""
         arr = np.asarray(lidar_raw, dtype=np.float32)
+        if arr.ndim == 2 and arr.shape[1] >= 3:
+            return self._pointcloud_to_bev(arr[:, :3])
         return self._normalize_range(arr)
 
     def _preprocess_radar(self, radar_raw: Any) -> np.ndarray:
         """Voxelize or project Radar to BEV images or patch tokens. Placeholder returns input as float32."""
         arr = np.asarray(radar_raw, dtype=np.float32)
+        if arr.ndim == 2 and arr.shape[1] >= 3:
+            return self._pointcloud_to_bev(arr[:, :3])
         return self._normalize_range(arr)
 
     def _preprocess_image(self, image_raw: Any, *, is_ir: bool = False) -> np.ndarray:
@@ -220,3 +228,33 @@ class CMHTDataSource:
             return float(int(stem)) / lidar_hz
         except ValueError:
             return index / lidar_hz
+
+    def _pointcloud_to_bev(self, points: np.ndarray) -> np.ndarray:
+        """
+        Simple BEV projection: occupancy and max-height channels on a fixed grid.
+
+        points: (N, 3) array with x, y, z.
+        """
+        x_limits, y_limits = self.bev_range
+        H = W = self.bev_size
+        x, y, z = points[:, 0], points[:, 1], points[:, 2]
+        mask = (
+            (x >= x_limits[0]) & (x <= x_limits[1]) &
+            (y >= y_limits[0]) & (y <= y_limits[1])
+        )
+        x, y, z = x[mask], y[mask], z[mask]
+        if x.size == 0:
+            return np.zeros((H, W, 2), dtype=np.float32)
+        x_norm = (x - x_limits[0]) / (x_limits[1] - x_limits[0])
+        y_norm = (y - y_limits[0]) / (y_limits[1] - y_limits[0])
+        xi = np.clip((x_norm * (W - 1)).astype(np.int32), 0, W - 1)
+        yi = np.clip((y_norm * (H - 1)).astype(np.int32), 0, H - 1)
+        occupancy = np.zeros((H, W), dtype=np.float32)
+        height = np.full((H, W), -np.inf, dtype=np.float32)
+        for i in range(xi.size):
+            occupancy[yi[i], xi[i]] = 1.0
+            height[yi[i], xi[i]] = max(height[yi[i], xi[i]], z[i])
+        height = np.where(np.isneginf(height), 0.0, height)
+        height = self._normalize_range(height)
+        bev = np.stack([occupancy, height], axis=-1)
+        return bev

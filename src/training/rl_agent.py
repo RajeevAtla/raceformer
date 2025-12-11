@@ -41,7 +41,7 @@ class PPOModel(nnx.Module):
         rngs = rngs or nnx.Rngs(0)
         self.modalities = tuple(modalities)
         self.log_std = nnx.Param(jnp.zeros((action_dim,)))
-        self.encoders = {
+        self.encoders = nnx.Dict({
             name: ModalityViT(
                 embed_dim=embed_dim,
                 depth=depth,
@@ -51,7 +51,7 @@ class PPOModel(nnx.Module):
                 rngs=rngs,
             )
             for name in self.modalities
-        }
+        })
         self.fusion = MultimodalFusion(embed_dim=embed_dim, depth=depth, num_heads=num_heads, rngs=rngs)
         self.policy = PolicyHead(embed_dim=embed_dim, action_dim=action_dim, rngs=rngs)
         self.value = ValueHead(embed_dim=embed_dim, rngs=rngs)
@@ -66,7 +66,7 @@ class PPOModel(nnx.Module):
         fused = self.fusion(fused, train=True)
         action_mean = self.policy(fused)
         values = self.value(fused)
-        log_std = jnp.broadcast_to(self.log_std.value, action_mean.shape)
+        log_std = jnp.broadcast_to(self.log_std[...], action_mean.shape)
         return action_mean, values.squeeze(-1), log_std
 
 
@@ -92,19 +92,22 @@ def ppo_loss(
 def run_ppo(config: dict[str, Any]) -> None:
     """Run PPO loop scaffold."""
     model_cfg = config["model"]
+    ppo_cfg = config.get("ppo", {})
+    env_cfg = config.get("env", {})
+    action_cfg = config.get("actions", {})
     modalities = ("lidar", "rgb")  # simulator lacks radar/ir; gps/imu handled outside token flow.
-    rngs = nnx.Rngs(config.get("seed", 0))
+    rngs = nnx.Rngs(env_cfg.get("seed", config.get("seed", 0)))
     model = PPOModel(
         embed_dim=model_cfg["embed_dim"],
         depth=model_cfg["depth"],
         num_heads=model_cfg["num_heads"],
         patch_size=model_cfg.get("patch_size", 16),
-        action_dim=config["action_dim"],
+        action_dim=action_cfg.get("dim", config.get("action_dim", 2)),
         modalities=modalities,
         rngs=rngs,
     )
-    optimizer = nnx.Optimizer(model, optax.adam(config.get("learning_rate", 3e-4)))
-    checkpoint_dir = config.get("checkpoint_dir", "runs/ppo/ckpt")
+    optimizer = nnx.Optimizer(model, optax.adam(ppo_cfg.get("learning_rate", config.get("learning_rate", 3e-4))))
+    checkpoint_dir = ppo_cfg.get("checkpoint_dir", config.get("checkpoint_dir", "runs/ppo/ckpt"))
     ckpt_mgr = _init_checkpoint_manager(checkpoint_dir) if ocp is not None else None
     if ckpt_mgr:
         restored = _restore_checkpoint(ckpt_mgr, model, optimizer)
@@ -112,12 +115,12 @@ def run_ppo(config: dict[str, Any]) -> None:
             model, optimizer = restored
 
     try:
-        env = RacecarGymWrapper(config.get("env_id", "Racecar-v0"), seed=config.get("seed", 0))
+        env = RacecarGymWrapper(env_cfg.get("id", config.get("env_id", "Racecar-v0")), seed=env_cfg.get("seed", config.get("seed", 0)))
         step_fn = jax_step(env)
-        if config.get("action_low") is None and getattr(env, "action_low", None) is not None:
-            config["action_low"] = env.action_low
-        if config.get("action_high") is None and getattr(env, "action_high", None) is not None:
-            config["action_high"] = env.action_high
+        if action_cfg.get("low") is None and getattr(env, "action_low", None) is not None:
+            action_cfg["low"] = env.action_low
+        if action_cfg.get("high") is None and getattr(env, "action_high", None) is not None:
+            action_cfg["high"] = env.action_high
     except Exception as exc:  # pragma: no cover - allows smoke testing without simulator
         print(f"racecar_gym unavailable ({exc}); using dummy rollout.")
         env = None
@@ -133,32 +136,32 @@ def run_ppo(config: dict[str, Any]) -> None:
         opt = opt.apply_gradient(grads)
         return model, opt, loss
 
-    gamma = config.get("gamma", 0.99)
-    gae_lambda = config.get("gae_lambda", 0.95)
-    update_epochs = config.get("update_epochs", 1)
+    gamma = ppo_cfg.get("gamma", config.get("gamma", 0.99))
+    gae_lambda = ppo_cfg.get("gae_lambda", config.get("gae_lambda", 0.95))
+    update_epochs = ppo_cfg.get("update_epochs", config.get("update_epochs", 1))
     rollout_rng = rngs
-    action_low = config.get("action_low")
-    action_high = config.get("action_high")
-    clip_eps = config.get("clip_eps", 0.2)
-    for step in range(config.get("steps", 2)):
+    action_low = action_cfg.get("low", config.get("action_low"))
+    action_high = action_cfg.get("high", config.get("action_high"))
+    clip_eps = ppo_cfg.get("clip_eps", config.get("clip_eps", 0.2))
+    for step in range(ppo_cfg.get("steps", config.get("steps", 2))):
         batch, rollout_rng = _rollout_batch(
             env,
             model,
             step_fn,
-            config.get("batch_size", 2),
-            config["action_dim"],
+            ppo_cfg.get("batch_size", config.get("batch_size", 2)),
+            action_cfg.get("dim", config.get("action_dim", 2)),
             rollout_rng,
             gamma,
             gae_lambda,
             action_low,
             action_high,
-        ) if env else (_dummy_batch(config.get("batch_size", 2), config["action_dim"]), rollout_rng)
+        ) if env else (_dummy_batch(ppo_cfg.get("batch_size", config.get("batch_size", 2)), action_cfg.get("dim", config.get("action_dim", 2))), rollout_rng)
         batch = _normalize_advantages(batch)
         loss = 0.0
         for _ in range(update_epochs):
             for minibatch in _iter_minibatches(
                 batch,
-                config.get("minibatch_size", config.get("batch_size", 2)),
+                ppo_cfg.get("minibatch_size", config.get("minibatch_size", config.get("batch_size", 2))),
                 key=jax.random.PRNGKey(step),
             ):
                 model, optimizer, loss = train_step(model, optimizer, minibatch, rngs, clip_eps)
@@ -188,7 +191,7 @@ def _rollout_batch(
     """
     obs = env.reset()
     observations = []
-        actions = []
+    actions = []
     rewards = []
     values = []
     log_probs = []
@@ -244,7 +247,7 @@ def _dummy_batch(batch_size: int, action_dim: int) -> dict[str, jnp.ndarray]:
     }
 
 
-def _iter_minibatches(batch: dict[str, jnp.ndarray], minibatch_size: int, *, key: jax.random.KeyArray | None = None):
+def _iter_minibatches(batch: dict[str, jnp.ndarray], minibatch_size: int, *, key: Any | None = None):
     """Yield minibatches by shuffling indices and slicing."""
     total = next(iter(batch.values())).shape[0]
     rng = key if key is not None else jax.random.PRNGKey(0)
@@ -282,7 +285,7 @@ def mask_missing_modalities(obs: dict[str, Any]) -> dict[str, Any]:
     return masked
 
 
-def _sample_gaussian(mean: jnp.ndarray, log_std: jnp.ndarray, rng: jax.random.KeyArray) -> jnp.ndarray:
+def _sample_gaussian(mean: jnp.ndarray, log_std: jnp.ndarray, rng: Any) -> jnp.ndarray:
     std = jnp.exp(log_std)
     noise = jax.random.normal(rng, shape=mean.shape)
     return mean + noise * std
@@ -294,7 +297,7 @@ def _gaussian_logprob(actions: jnp.ndarray, mean: jnp.ndarray, log_std: jnp.ndar
     return log_prob.sum(axis=-1)
 
 
-def _sample_tanh_gaussian(mean: jnp.ndarray, log_std: jnp.ndarray, rng: jax.random.KeyArray, epsilon: float = 1e-6) -> tuple[jnp.ndarray, jnp.ndarray]:
+def _sample_tanh_gaussian(mean: jnp.ndarray, log_std: jnp.ndarray, rng: Any, epsilon: float = 1e-6) -> tuple[jnp.ndarray, jnp.ndarray]:
     """
     Sample from a squashed Gaussian and return action and corrected log-prob.
     """

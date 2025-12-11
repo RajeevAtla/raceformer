@@ -26,12 +26,18 @@ class FusionBlock(nnx.Module):
 
     def __init__(self, dim: int, num_heads: int, mlp_ratio: float = 4.0, *, rngs: nnx.Rngs):
         self.ln1 = nnx.LayerNorm(dim, use_bias=True, rngs=rngs)
-        self.attn = nnx.MultiHeadAttention(embed_dim=dim, num_heads=num_heads, rngs=rngs)
+        self.attn = nnx.MultiHeadAttention(
+            num_heads=num_heads,
+            in_features=dim,
+            qkv_features=dim,
+            out_features=dim,
+            rngs=rngs,
+        )
         self.ln2 = nnx.LayerNorm(dim, use_bias=True, rngs=rngs)
         self.mlp = FusionMLP(dim=dim, mlp_dim=int(dim * mlp_ratio), rngs=rngs)
 
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        x = x + self.attn(self.ln1(x))
+        x = x + self.attn(self.ln1(x), decode=False)
         x = x + self.mlp(self.ln2(x))
         return x
 
@@ -44,10 +50,10 @@ class MultimodalFusion(nnx.Module):
         self.embed_dim = embed_dim
         self.depth = depth
         self.num_heads = num_heads
-        self.blocks = [
+        self.blocks = nnx.List([
             FusionBlock(dim=embed_dim, num_heads=num_heads, rngs=rngs)
             for _ in range(depth)
-        ]
+        ])
         self.norm = nnx.LayerNorm(embed_dim, use_bias=True, rngs=rngs)
 
     def __call__(self, tokens: jnp.ndarray, *, train: bool = True) -> jnp.ndarray:

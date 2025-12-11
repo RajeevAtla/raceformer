@@ -21,7 +21,11 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "ruff",
+    "pytest",
 ]
+
+[project.scripts]
+raceformer = "main:main"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]

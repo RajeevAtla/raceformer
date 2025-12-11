@@ -139,7 +139,7 @@ def run_pretraining(config: dict[str, Any]) -> None:
             _save_checkpoint(ckpt_mgr, step, model, optimizer)
 
 
-def _mask_tokens(tokens: jnp.ndarray, mask_ratio: float, *, rng: jax.random.KeyArray) -> tuple[jnp.ndarray, jnp.ndarray]:
+def _mask_tokens(tokens: jnp.ndarray, mask_ratio: float, *, rng: Any) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Randomly mask a ratio of tokens; returns masked tokens and mask indices."""
     mask = jax.random.bernoulli(rng, mask_ratio, tokens.shape[:-1])
     masked = jnp.where(mask[..., None], 0, tokens)

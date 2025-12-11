@@ -57,12 +57,18 @@ class TransformerBlock(nnx.Module):
 
     def __init__(self, dim: int, num_heads: int, mlp_ratio: float = 4.0, *, rngs: nnx.Rngs):
         self.ln1 = nnx.LayerNorm(dim, use_bias=True, rngs=rngs)
-        self.attn = nnx.MultiHeadAttention(embed_dim=dim, num_heads=num_heads, rngs=rngs)
+        self.attn = nnx.MultiHeadAttention(
+            num_heads=num_heads,
+            in_features=dim,
+            qkv_features=dim,
+            out_features=dim,
+            rngs=rngs,
+        )
         self.ln2 = nnx.LayerNorm(dim, use_bias=True, rngs=rngs)
         self.mlp = MLPBlock(dim=dim, mlp_dim=int(dim * mlp_ratio), rngs=rngs)
 
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        x = x + self.attn(self.ln1(x))
+        x = x + self.attn(self.ln1(x), decode=False)
         x = x + self.mlp(self.ln2(x))
         return x
 
@@ -92,11 +98,11 @@ class ModalityViT(nnx.Module):
         self.patch_size = patch_size
         self.patch_embed = PatchEmbed(embed_dim=embed_dim, patch_size=patch_size, in_channels=in_channels, rngs=rngs)
         # Positional embedding initialized lazily based on input spatial dims.
-        self.positional: nnx.Param | None = None
-        self.blocks = [
+        self.positional = nnx.data(None)
+        self.blocks = nnx.List([
             TransformerBlock(dim=embed_dim, num_heads=num_heads, rngs=rngs)
             for _ in range(depth)
-        ]
+        ])
         self.norm = nnx.LayerNorm(embed_dim, use_bias=True, rngs=rngs)
 
     def _init_positional(self, num_tokens: int) -> None:
@@ -108,7 +114,7 @@ class ModalityViT(nnx.Module):
         tokens = self.patch_embed(x)
         b, n, _ = tokens.shape
         self._init_positional(n)
-        pos = self.positional.value if isinstance(self.positional, nnx.Param) else self.positional  # type: ignore[arg-type]
+        pos = self.positional[...] if isinstance(self.positional, nnx.Param) else self.positional  # type: ignore[arg-type]
         tokens = tokens + pos
         for block in self.blocks:
             tokens = block(tokens)

@@ -14,7 +14,7 @@ import numpy as np
 
 try:
     import racecar_gym  # type: ignore
-except ImportError:  # pragma: no cover - simulator installed separately
+except Exception:  # pragma: no cover - simulator installed separately or broken install
     racecar_gym = None
 
 
