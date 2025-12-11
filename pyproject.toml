@@ -3,19 +3,19 @@ name = "raceformer"
 version = "0.1.0"
 description = "Pretraining multimodal transformers for autonomous racing RL"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.11"
 dependencies = [
     "dm-tree",
-    "flax>=0.8.4",
+    "flax",
     "grain",
     "gym",
-    "jax[cuda13]",
+    "jax==0.8.1",
     "jaxlib",
     "numpy",
     "optax",
     "orbax-checkpoint",
     "pybullet",
-    "racecar-gym @ git+https://github.com/axelbr/racecar_gym.git",
+    "racecar-gym @ git+https://github.com/RajeevAtla/racecar_gym.git",
 ]
 
 [project.optional-dependencies]
