@@ -1,0 +1,18 @@
+[model]
+embed_dim = 256
+depth = 6
+num_heads = 8
+patch_size = 16
+fusion_depth = 6
+out_dim = 0
+
+[training]
+batch_size = 64
+learning_rate = 3e-4
+steps = 100000
+mask_ratio = 0.5
+checkpoint_dir = "runs/example/ckpt"
+
+[data]
+path = "/path/to/cmht"
+include_modalities = ["lidar", "rgb", "radar", "ir", "gps", "imu"]

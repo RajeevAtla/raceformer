@@ -1,0 +1,23 @@
+[env]
+id = "Racecar-v0"
+seed = 0
+max_steps = 1000
+
+[model]
+embed_dim = 256
+depth = 6
+num_heads = 8
+patch_size = 16
+fusion_depth = 6
+
+[ppo]
+learning_rate = 3e-4
+clip_eps = 0.2
+gae_lambda = 0.95
+gamma = 0.99
+batch_size = 64
+update_epochs = 4
+
+[finetune]
+freeze_encoders = false
+pretrained_ckpt = "runs/example/ckpt"
