@@ -10,6 +10,10 @@ from typing import Any, Iterable
 import jax
 import jax.numpy as jnp
 import optax
+try:
+    import orbax.checkpoint as ocp
+except ImportError:  # pragma: no cover - optional dependency
+    ocp = None
 from flax import nnx
 
 from src.data.cmht_loader import CMHTDataSource
@@ -79,7 +83,7 @@ def run_pretraining(config: dict[str, Any]) -> None:
     modalities: Iterable[str] = config["data"].get(
         "include_modalities", ("lidar", "rgb", "radar", "ir")
     )
-    _data = CMHTDataSource(data_path, include_modalities=tuple(modalities))
+    data_source = CMHTDataSource(data_path, include_modalities=tuple(modalities))
     model_cfg = config["model"]
     training_cfg = config["training"]
 
@@ -93,6 +97,12 @@ def run_pretraining(config: dict[str, Any]) -> None:
         rngs=rngs,
     )
     optimizer = nnx.Optimizer(model, optax.adamw(training_cfg["learning_rate"]))
+    checkpoint_dir = Path(training_cfg.get("checkpoint_dir", "runs/example/ckpt"))
+    ckpt_mgr = _init_checkpoint_manager(checkpoint_dir) if ocp is not None else None
+    if ckpt_mgr:
+        restored = _restore_checkpoint(ckpt_mgr, model, optimizer)
+        if restored:
+            model, optimizer = restored
 
     def loss_fn(model: MultimodalPretrainModel, batch: dict[str, jnp.ndarray], rngs: nnx.Rngs) -> jnp.ndarray:
         preds, mask = model(batch, training_cfg["mask_ratio"], rngs=rngs)
@@ -110,12 +120,18 @@ def run_pretraining(config: dict[str, Any]) -> None:
         return model, opt, loss
 
     # Placeholder loop; replace with real Grain loader iteration.
+    batch_iter = _batch_iterator(data_source, training_cfg["batch_size"])
     for step in range(training_cfg["steps"]):
-        dummy_batch = _dummy_batch(training_cfg["batch_size"])
-        model, optimizer, loss = train_step(model, optimizer, dummy_batch, rngs)
+        try:
+            batch = next(batch_iter)
+        except StopIteration:
+            batch_iter = _batch_iterator(data_source, training_cfg["batch_size"])
+            batch = next(batch_iter)
+        model, optimizer, loss = train_step(model, optimizer, batch, rngs)
         if step % training_cfg.get("log_every", 100) == 0:
             print(f"step {step}: loss {loss}")
-    # TODO: add orbax checkpoint saving to runs/{run_name}/ckpt.
+        if ckpt_mgr and step % training_cfg.get("checkpoint_every", 1000) == 0:
+            _save_checkpoint(ckpt_mgr, step, model, optimizer)
 
 
 def _mask_tokens(tokens: jnp.ndarray, mask_ratio: float, *, rng: jax.random.KeyArray) -> tuple[jnp.ndarray, jnp.ndarray]:
@@ -134,6 +150,84 @@ def _dummy_batch(batch_size: int) -> dict[str, jnp.ndarray]:
         "radar": jnp.zeros((batch_size, h, w, 1), dtype=jnp.float32),
         "ir": jnp.zeros((batch_size, h, w, 1), dtype=jnp.float32),
     }
+
+
+def _batch_iterator(data_source: CMHTDataSource, batch_size: int):
+    """
+    Collate samples from CMHTDataSource into batches of JAX arrays.
+
+    Falls back to dummy batches if the datasource cannot be iterated.
+    """
+    try:
+        buffer = []
+        for sample in data_source:
+            buffer.append(sample)
+            if len(buffer) == batch_size:
+                yield _collate(buffer)
+                buffer = []
+        if buffer:
+            yield _collate(buffer)
+    except Exception as exc:  # pragma: no cover - allows running without dataset
+        print(f"CMHTDataSource failed ({exc}); using dummy batches.")
+        while True:
+            yield _dummy_batch(batch_size)
+
+
+def _collate(samples: list[dict[str, Any]]) -> dict[str, jnp.ndarray]:
+    """Stack list of sample dicts into batch dict of arrays."""
+    batch = {}
+    for key in samples[0]:
+        batch[key] = jnp.asarray([s[key] for s in samples])
+    return batch
+
+
+def _init_checkpoint_manager(checkpoint_dir: Path):
+    """Initialize an Orbax checkpoint manager if available."""
+    if ocp is None:
+        return None
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    options = ocp.CheckpointManagerOptions(max_to_keep=3, create=True)
+    return ocp.CheckpointManager(
+        checkpoint_dir,
+        item_names=("train_state",),
+        options=options,
+        checkpointers={"train_state": ocp.Checkpointer(ocp.PyTreeCheckpointHandler())},
+    )
+
+
+def _save_checkpoint(ckpt_mgr, step: int, model: MultimodalPretrainModel, optimizer: nnx.Optimizer) -> None:
+    """Save model and optimizer state with Orbax."""
+    if ckpt_mgr is None or ocp is None:
+        return
+    to_save = {
+        "model": nnx.state(model),
+        "optimizer": optimizer.state,
+    }
+    try:
+        ckpt_mgr.save(step, args=to_save)
+    except Exception as exc:  # pragma: no cover - avoid hard failure in scaffolding
+        print(f"Checkpoint save failed at step {step}: {exc}")
+
+
+def _restore_checkpoint(ckpt_mgr, model: MultimodalPretrainModel, optimizer: nnx.Optimizer):
+    """Restore latest checkpoint if present; returns (model, optimizer) or None."""
+    if ckpt_mgr is None or ocp is None:
+        return None
+    latest = ckpt_mgr.latest_step()
+    if latest is None:
+        return None
+    try:
+        restored = ckpt_mgr.restore(latest, args=ocp.args.Composite(
+            model=nnx.state(model),
+            optimizer=optimizer.state,
+        ))
+        model = nnx.merge(model, restored["model"])
+        optimizer = optimizer.replace_state(restored["optimizer"])
+        print(f"Restored checkpoint from step {latest}")
+        return model, optimizer
+    except Exception as exc:  # pragma: no cover
+        print(f"Checkpoint restore failed: {exc}")
+        return None
 
 
 def main() -> None:
