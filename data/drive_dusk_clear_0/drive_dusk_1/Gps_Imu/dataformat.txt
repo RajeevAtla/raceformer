@@ -1,0 +1,8 @@
+latitude (ddmm.mmmm)
+longitude (ddmm.mmmm)
+angular velocity around x (rad/s)
+angular velocity around y (rad/s)
+angular velocity around z (rad/s)
+linear acceleration in the x direction (G)
+linear acceleration in the y direction (G)
+linear acceleration in the z direction (G)
